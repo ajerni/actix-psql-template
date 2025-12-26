@@ -1,0 +1,51 @@
+version: "3.7"
+
+services:
+  actix-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: actix_server
+    restart: always
+    ports:
+      - "8083:8080"
+    environment:
+      DATABASE_URL: postgresql://actix_user:actix_password@actix-server-postgres:5432/actix_db
+    networks:
+      - iotnetwork
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.actix-server.rule=Host(`actix.ernilabs.com`)
+      - traefik.http.routers.actix-server.tls=true
+      - traefik.http.routers.actix-server.tls.certresolver=lets-encrypt
+      - traefik.http.services.actix-server.loadbalancer.server.port=8080
+    depends_on:
+      - actix-server-postgres
+
+  actix-server-postgres:
+    image: postgres:16-alpine
+    container_name: actix_server_postgres
+    restart: always
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: actix_user
+      POSTGRES_PASSWORD: actix_password
+      POSTGRES_DB: actix_db
+    volumes:
+      - actix_server_postgres_data:/var/lib/postgresql/data
+    networks:
+      - iotnetwork
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U actix_user -d actix_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  iotnetwork:
+    external: true
+
+volumes:
+  actix_server_postgres_data:
+
