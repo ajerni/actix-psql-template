@@ -17,11 +17,16 @@ if [ ! -f "Cargo.toml" ]; then
     exit 1
 fi
 
-# Extract project name from Cargo.toml
-PROJECT_NAME=$(grep -E '^name\s*=' Cargo.toml | head -1 | sed -E 's/^name\s*=\s*"([^"]+)".*/\1/')
+# Extract project name from Cargo.toml (get the package name, not the binary name)
+# Look for name = in the [package] section specifically
+PROJECT_NAME=$(awk '/^\[package\]/ {in_package=1} in_package && /^name =/ {gsub(/"/, "", $3); print $3; exit} /^\[/ && !/^\[package\]/ {in_package=0}' Cargo.toml)
 if [ -z "$PROJECT_NAME" ]; then
-    echo -e "${RED}Error: Could not extract project name from Cargo.toml${NC}"
-    exit 1
+    # Fallback: try the simpler method (first name = line, which should be package name)
+    PROJECT_NAME=$(awk -F'"' '/^name =/ {print $2; exit}' Cargo.toml)
+    if [ -z "$PROJECT_NAME" ]; then
+        echo -e "${RED}Error: Could not extract project name from Cargo.toml${NC}"
+        exit 1
+    fi
 fi
 
 # Convert project name to underscore format for table name
@@ -69,7 +74,10 @@ FIELD_NAMES=()
 RUST_TYPES=()
 
 echo -e "${GREEN}Let's define the table fields!${NC}"
-echo "The table will automatically include an 'id' field (SERIAL PRIMARY KEY)"
+echo "The table will automatically include:"
+echo "  - id field (SERIAL PRIMARY KEY)"
+echo "  - created_on field (TIMESTAMP WITH TIME ZONE, auto-set on creation)"
+echo "  - changed_on field (TIMESTAMP WITH TIME ZONE, auto-updated on changes)"
 echo ""
 
 ADD_MORE="y"
@@ -162,6 +170,8 @@ fi
 echo ""
 echo -e "${YELLOW}Table structure:${NC}"
 echo "  id SERIAL PRIMARY KEY"
+echo "  created_on TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
+echo "  changed_on TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
 for field in "${FIELDS[@]}"; do
     echo "  $field"
 done
@@ -175,7 +185,9 @@ fi
 
 # Build CREATE TABLE SQL
 SQL="CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
-    id SERIAL PRIMARY KEY"
+    id SERIAL PRIMARY KEY,
+    created_on TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    changed_on TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
 
 for field in "${FIELDS[@]}"; do
     SQL="${SQL},
@@ -191,6 +203,31 @@ echo "$SQL" | docker exec -i "$CONTAINER_NAME" psql -U "$POSTGRES_USER" -d "$POS
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓ Table '${TABLE_NAME}' created successfully!${NC}"
+    
+    # Create trigger function to automatically update changed_on
+    echo "Creating trigger to auto-update changed_on..."
+    TRIGGER_SQL="
+CREATE OR REPLACE FUNCTION update_changed_on_column()
+RETURNS TRIGGER AS \$\$
+BEGIN
+    NEW.changed_on = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+\$\$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS update_${TABLE_NAME}_changed_on ON ${TABLE_NAME};
+CREATE TRIGGER update_${TABLE_NAME}_changed_on
+    BEFORE UPDATE ON ${TABLE_NAME}
+    FOR EACH ROW
+    EXECUTE FUNCTION update_changed_on_column();
+"
+    echo "$TRIGGER_SQL" | docker exec -i "$CONTAINER_NAME" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ Trigger created successfully!${NC}"
+    else
+        echo -e "${YELLOW}Warning: Failed to create trigger, but table was created${NC}"
+    fi
 else
     echo -e "${RED}Error: Failed to create table${NC}"
     exit 1
@@ -202,11 +239,31 @@ echo "Generating CRUD operations for main.rs..."
 
 # Convert snake_case to camelCase for Rust field names
 to_camel_case() {
-    echo "$1" | sed -r 's/_([a-z])/\U\1/g' | sed 's/^./\U&/'
+    # Convert snake_case to camelCase (first letter lowercase, rest camelCase)
+    echo "$1" | sed -r 's/_([a-z])/\U\1/g' | sed 's/^[a-z]/\L&/'
 }
 
-# Generate struct name (PascalCase)
-STRUCT_NAME=$(echo "$PROJECT_NAME_UNDERSCORE" | sed -r 's/_([a-z])/\U\1/g' | sed 's/^./\U&/')
+# Generate struct name (PascalCase) - ensure first letter is uppercase
+# Convert snake_case to PascalCase: actixtest -> Actixtest, my_project -> MyProject
+# Use awk to properly handle case conversion
+STRUCT_NAME=$(echo "$PROJECT_NAME_UNDERSCORE" | awk '{
+    result = ""
+    split($0, parts, "_")
+    for (i = 1; i <= length(parts); i++) {
+        if (length(parts[i]) > 0) {
+            first_char = toupper(substr(parts[i], 1, 1))
+            rest = substr(parts[i], 2)
+            result = result first_char rest
+        }
+    }
+    if (length(result) == 0) {
+        # If no underscores, just capitalize first letter
+        first_char = toupper(substr($0, 1, 1))
+        rest = substr($0, 2)
+        result = first_char rest
+    }
+    print result
+}')
 STRUCT_NAME="${STRUCT_NAME}Record"
 REQUEST_NAME="Create${STRUCT_NAME}Request"
 
@@ -221,13 +278,15 @@ cat > "$CRUD_FILE" << EOF
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct ${STRUCT_NAME} {
     pub id: i32,
+    pub created_on: chrono::DateTime<chrono::Utc>,
+    pub changed_on: chrono::DateTime<chrono::Utc>,
 EOF
 
 for i in "${!FIELD_NAMES[@]}"; do
     FIELD_NAME="${FIELD_NAMES[$i]}"
-    CAMEL_FIELD=$(to_camel_case "$FIELD_NAME")
+    # Use snake_case for database fields (not camelCase) to match SQL column names
     RUST_TYPE="${RUST_TYPES[$i]}"
-    echo "    pub ${CAMEL_FIELD}: ${RUST_TYPE}," >> "$CRUD_FILE"
+    echo "    pub ${FIELD_NAME}: ${RUST_TYPE}," >> "$CRUD_FILE"
 done
 
 cat >> "$CRUD_FILE" << EOF
@@ -239,9 +298,9 @@ EOF
 
 for i in "${!FIELD_NAMES[@]}"; do
     FIELD_NAME="${FIELD_NAMES[$i]}"
-    CAMEL_FIELD=$(to_camel_case "$FIELD_NAME")
+    # Use snake_case for database fields (not camelCase) to match SQL column names
     RUST_TYPE="${RUST_TYPES[$i]}"
-    echo "    pub ${CAMEL_FIELD}: ${RUST_TYPE}," >> "$CRUD_FILE"
+    echo "    pub ${FIELD_NAME}: ${RUST_TYPE}," >> "$CRUD_FILE"
 done
 
 cat >> "$CRUD_FILE" << EOF
@@ -255,6 +314,7 @@ async fn create_${PROJECT_NAME_UNDERSCORE}(
 EOF
 
 # Build INSERT query dynamically
+# created_on and changed_on are automatically set by the database, so we don't include them in INSERT
 if [ ${#FIELD_NAMES[@]} -gt 0 ]; then
     # Build query string using string concatenation
     echo "    let fields: Vec<&str> = vec![" >> "$CRUD_FILE"
@@ -263,26 +323,26 @@ if [ ${#FIELD_NAMES[@]} -gt 0 ]; then
     done
     echo "    ];" >> "$CRUD_FILE"
     echo "    let fields_str = fields.join(\", \");" >> "$CRUD_FILE"
-    echo "    let placeholders: Vec<String> = (1..=${#FIELD_NAMES[@]}).map(|i| format!(\"\\${}\", i)).collect();" >> "$CRUD_FILE"
+    echo '    let placeholders: Vec<String> = (1..=fields.len()).map(|i| format!("${}", i)).collect();' >> "$CRUD_FILE"
     echo "    let values_str = placeholders.join(\", \");" >> "$CRUD_FILE"
     echo "    let query = format!(\"INSERT INTO ${TABLE_NAME} ({}) VALUES ({}) RETURNING *\", fields_str, values_str);" >> "$CRUD_FILE"
     echo "" >> "$CRUD_FILE"
-    echo "    let mut query_builder = sqlx::query_as::<_, ${STRUCT_NAME}>(&query);" >> "$CRUD_FILE"
+    echo "    let result = sqlx::query_as::<_, ${STRUCT_NAME}>(&query)" >> "$CRUD_FILE"
     for i in "${!FIELD_NAMES[@]}"; do
         FIELD_NAME="${FIELD_NAMES[$i]}"
-        CAMEL_FIELD=$(to_camel_case "$FIELD_NAME")
-        echo "    query_builder = query_builder.bind(&record.${CAMEL_FIELD});" >> "$CRUD_FILE"
+        echo "        .bind(&record.${FIELD_NAME})" >> "$CRUD_FILE"
     done
+    echo "        .fetch_one(pool.get_ref())" >> "$CRUD_FILE"
+    echo "        .await;" >> "$CRUD_FILE"
 else
     echo "    let query = \"INSERT INTO ${TABLE_NAME} DEFAULT VALUES RETURNING *\";" >> "$CRUD_FILE"
-    echo "    let query_builder = sqlx::query_as::<_, ${STRUCT_NAME}>(query);" >> "$CRUD_FILE"
+    echo "" >> "$CRUD_FILE"
+    echo "    let result = sqlx::query_as::<_, ${STRUCT_NAME}>(query)" >> "$CRUD_FILE"
+    echo "        .fetch_one(pool.get_ref())" >> "$CRUD_FILE"
+    echo "        .await;" >> "$CRUD_FILE"
 fi
 
 cat >> "$CRUD_FILE" << EOF
-
-    let result = query_builder
-        .fetch_one(pool.get_ref())
-        .await;
 
     match result {
         Ok(record) => Ok(web::Json(record)),
@@ -298,7 +358,7 @@ async fn get_${PROJECT_NAME_UNDERSCORE}(
     id: web::Path<i32>,
 ) -> Result<impl Responder> {
     let result = sqlx::query_as::<_, ${STRUCT_NAME}>(
-        "SELECT * FROM ${TABLE_NAME} WHERE id = \\$1"
+        "SELECT * FROM ${TABLE_NAME} WHERE id = \$1"
     )
     .bind(id.into_inner())
     .fetch_optional(pool.get_ref())
@@ -340,6 +400,7 @@ async fn update_${PROJECT_NAME_UNDERSCORE}(
 EOF
 
 # Build UPDATE query dynamically
+# changed_on is automatically updated by the database trigger, so we don't need to set it explicitly
 if [ ${#FIELD_NAMES[@]} -gt 0 ]; then
     # Build SET clause using string concatenation
     echo "    let field_names: Vec<&str> = vec![" >> "$CRUD_FILE"
@@ -347,27 +408,29 @@ if [ ${#FIELD_NAMES[@]} -gt 0 ]; then
         echo "        \"${name}\"," >> "$CRUD_FILE"
     done
     echo "    ];" >> "$CRUD_FILE"
-    echo "    let set_clauses: Vec<String> = field_names.iter().enumerate().map(|(i, name)| format!(\"{} = \\${}\", name, i + 2)).collect();" >> "$CRUD_FILE"
+    echo '    let set_clauses: Vec<String> = field_names.iter().enumerate().map(|(i, name)| format!("{} = ${}", name, i + 2)).collect();' >> "$CRUD_FILE"
     echo "    let set_clause = set_clauses.join(\", \");" >> "$CRUD_FILE"
-    echo "    let query = format!(\"UPDATE ${TABLE_NAME} SET {} WHERE id = \\$1 RETURNING *\", set_clause);" >> "$CRUD_FILE"
+    echo "    let query = format!(\"UPDATE ${TABLE_NAME} SET {} WHERE id = \$1 RETURNING *\", set_clause);" >> "$CRUD_FILE"
     echo "" >> "$CRUD_FILE"
-    echo "    let mut query_builder = sqlx::query_as::<_, ${STRUCT_NAME}>(&query);" >> "$CRUD_FILE"
-    echo "    query_builder = query_builder.bind(id.into_inner());" >> "$CRUD_FILE"
+    echo "    let result = sqlx::query_as::<_, ${STRUCT_NAME}>(&query)" >> "$CRUD_FILE"
+    echo "        .bind(id.into_inner())" >> "$CRUD_FILE"
     for i in "${!FIELD_NAMES[@]}"; do
         FIELD_NAME="${FIELD_NAMES[$i]}"
-        CAMEL_FIELD=$(to_camel_case "$FIELD_NAME")
-        echo "    query_builder = query_builder.bind(&record.${CAMEL_FIELD});" >> "$CRUD_FILE"
+        echo "        .bind(&record.${FIELD_NAME})" >> "$CRUD_FILE"
     done
+    echo "        .fetch_optional(pool.get_ref())" >> "$CRUD_FILE"
+    echo "        .await;" >> "$CRUD_FILE"
 else
-    echo "    // No fields to update" >> "$CRUD_FILE"
-    echo "    return Err(actix_web::error::ErrorBadRequest(\"No fields to update\"));" >> "$CRUD_FILE"
+    # No fields to update, but trigger will still update changed_on
+    echo "    let query = \"UPDATE ${TABLE_NAME} SET id = id WHERE id = \\$1 RETURNING *\";" >> "$CRUD_FILE"
+    echo "" >> "$CRUD_FILE"
+    echo "    let result = sqlx::query_as::<_, ${STRUCT_NAME}>(query)" >> "$CRUD_FILE"
+    echo "        .bind(id.into_inner())" >> "$CRUD_FILE"
+    echo "        .fetch_optional(pool.get_ref())" >> "$CRUD_FILE"
+    echo "        .await;" >> "$CRUD_FILE"
 fi
 
 cat >> "$CRUD_FILE" << EOF
-
-    let result = query_builder
-        .fetch_optional(pool.get_ref())
-        .await;
 
     match result {
         Ok(Some(record)) => Ok(web::Json(record)),
@@ -383,7 +446,7 @@ async fn delete_${PROJECT_NAME_UNDERSCORE}(
     pool: web::Data<PgPool>,
     id: web::Path<i32>,
 ) -> Result<impl Responder> {
-    let result = sqlx::query("DELETE FROM ${TABLE_NAME} WHERE id = \\$1")
+    let result = sqlx::query("DELETE FROM ${TABLE_NAME} WHERE id = \$1")
         .bind(id.into_inner())
         .execute(pool.get_ref())
         .await;
@@ -410,9 +473,48 @@ echo "Updating main.rs..."
 # Backup main.rs
 cp main.rs main.rs.bak
 
-# Find the insertion point (after the db_check function, before main)
-# Insert the generated code before the main function
-sed -i.bak2 "/^#\[actix_web::main\]/r $CRUD_FILE" main.rs
+# Step 1: Remove any existing generated code to avoid duplicates
+# Remove from "// Generated by setup-db.sh" until we hit "#[actix_web::main]" or "async fn main()"
+if grep -q "// Generated by setup-db.sh" main.rs; then
+    awk '
+        /^\/\/ Generated by setup-db\.sh/ { skip=1; next }
+        skip && (/^#\[actix_web::main\]/ || /^async fn main\(\)/) { skip=0 }
+        !skip { print }
+    ' main.rs > main.rs.tmp && mv main.rs.tmp main.rs
+fi
+
+# Step 2: Remove any misplaced #[actix_web::main] that's not immediately before "async fn main"
+# We'll add it back in the right place in step 4
+sed -i.bak2 '/^#\[actix_web::main\]$/d' main.rs
+
+# Step 3: Insert the generated code before "async fn main"
+# Use awk to properly insert BEFORE the "async fn main" line
+awk -v crud_file="$CRUD_FILE" '
+    /^async fn main/ {
+        # Read and print the generated CRUD code
+        while ((getline line < crud_file) > 0) {
+            print line
+        }
+        close(crud_file)
+        print ""  # Add blank line before main
+    }
+    { print }
+' main.rs > main.rs.tmp && mv main.rs.tmp main.rs
+
+# Step 4: Ensure #[actix_web::main] is present right before async fn main
+# Check if the line immediately before "async fn main" contains "#[actix_web::main]"
+if ! grep -B1 "^async fn main" main.rs | head -1 | grep -q "#\[actix_web::main\]"; then
+    # Add #[actix_web::main] right before async fn main using awk
+    awk '
+        /^async fn main/ {
+            print "#[actix_web::main]"
+        }
+        { print }
+    ' main.rs > main.rs.tmp && mv main.rs.tmp main.rs
+fi
+
+# Clean up backup files
+rm -f main.rs.bak2
 
 # Create routes file
 ROUTES_FILE=$(mktemp)
@@ -425,13 +527,42 @@ cat > "$ROUTES_FILE" << ROUTES_EOF
 ROUTES_EOF
 
 # Update the main function to add routes
-# Find the service scope and add the CRUD routes
+# First, remove any existing routes for this table to avoid duplicates
+sed -i.bak5 "/\.route(\"\/${PROJECT_NAME_UNDERSCORE}/d" main.rs
+
+# Find the service scope and add the CRUD routes using awk
 if grep -q '\.route("/db"' main.rs; then
-    # Insert routes after the /db route
-    sed -i.bak3 "/\.route(\"\/db\"/r $ROUTES_FILE" main.rs
+    # Insert routes after the /db route using awk
+    awk -v routes_file="$ROUTES_FILE" '
+        /\.route\("\/db"/ {
+            print
+            # Read and print the routes
+            while ((getline line < routes_file) > 0) {
+                print line
+            }
+            close(routes_file)
+            next
+        }
+        { print }
+    ' main.rs > main.rs.tmp && mv main.rs.tmp main.rs
 elif grep -q 'web::scope("/api")' main.rs; then
-    # Find the API scope and add routes before closing
-    sed -i.bak3 "/\.service(web::scope(\"\/api\")/,/)/r $ROUTES_FILE" main.rs
+    # Insert after the first route in the API scope
+    awk -v routes_file="$ROUTES_FILE" '
+        !done && /\.service\(web::scope\("\/api"\)/ {
+            in_scope = 1
+        }
+        !done && in_scope && /\.route\(/ {
+            print
+            # Read and print the routes
+            while ((getline line < routes_file) > 0) {
+                print line
+            }
+            close(routes_file)
+            done = 1
+            next
+        }
+        { print }
+    ' main.rs > main.rs.tmp && mv main.rs.tmp main.rs
 else
     echo -e "${YELLOW}Warning: Could not find API scope in main.rs. Please add routes manually.${NC}"
     echo "Routes to add:"
@@ -439,7 +570,7 @@ else
 fi
 
 # Clean up temporary files
-rm -f main.rs.bak2 main.rs.bak3 "$ROUTES_FILE"
+rm -f main.rs.bak5 "$ROUTES_FILE" "$CRUD_FILE"
 
 echo -e "${GREEN}✓ CRUD operations added to main.rs!${NC}"
 echo ""

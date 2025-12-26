@@ -1,43 +1,43 @@
 version: "3.7"
 
 services:
-  actix-server:
+  actfinal:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: actix_server
+    container_name: actfinal
     restart: always
     ports:
       - "8083:8080"
     environment:
-      DATABASE_URL: postgresql://actix_user:actix_password@actix-server-postgres:5432/actix_db
+      DATABASE_URL: postgresql://actfinal_user:qwert@actfinal-postgres:5432/actfinal_db
     networks:
       - iotnetwork
     labels:
       - traefik.enable=true
-      - traefik.http.routers.actix-server.rule=Host(`actix.ernilabs.com`)
-      - traefik.http.routers.actix-server.tls=true
-      - traefik.http.routers.actix-server.tls.certresolver=lets-encrypt
-      - traefik.http.services.actix-server.loadbalancer.server.port=8080
+      - traefik.http.routers.actfinal.rule=Host(`actfinal.ernilabs.com`)
+      - traefik.http.routers.actfinal.tls=true
+      - traefik.http.routers.actfinal.tls.certresolver=lets-encrypt
+      - traefik.http.services.actfinal.loadbalancer.server.port=8080
     depends_on:
-      - actix-server-postgres
+      - actfinal-postgres
 
-  actix-server-postgres:
+  actfinal-postgres:
     image: postgres:16-alpine
-    container_name: actix_server_postgres
+    container_name: actfinal_postgres
     restart: always
     ports:
       - "5433:5432"
     environment:
-      POSTGRES_USER: actix_user
-      POSTGRES_PASSWORD: actix_password
-      POSTGRES_DB: actix_db
+      POSTGRES_USER: actfinal_user
+      POSTGRES_PASSWORD: qwert
+      POSTGRES_DB: actfinal_db
     volumes:
-      - actix_server_postgres_data:/var/lib/postgresql/data
+      - actfinal_postgres_data:/var/lib/postgresql/data
     networks:
       - iotnetwork
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U actix_user -d actix_db"]
+      test: ["CMD-SHELL", "pg_isready -U actfinal_user -d actfinal_db"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -47,5 +47,4 @@ networks:
     external: true
 
 volumes:
-  actix_server_postgres_data:
-
+  actfinal_postgres_data:

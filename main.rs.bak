@@ -1,0 +1,68 @@
+use actix_web::{web, App, HttpServer, Responder, Result};
+use sqlx::{PgPool, Row};
+
+async fn index() -> impl Responder {
+    "Hello from Actix Web!"
+}
+
+async fn health() -> impl Responder {
+    "OK"
+}
+
+async fn name(path: web::Path<String>) -> impl Responder {
+    format!("Hello, {}!", path.into_inner())
+}
+
+async fn db_check(pool: web::Data<PgPool>) -> Result<impl Responder> {
+    let result = sqlx::query("SELECT NOW() as current_time, version() as pg_version")
+        .fetch_one(pool.get_ref())
+        .await;
+
+    match result {
+        Ok(row) => {
+            let current_time: chrono::DateTime<chrono::Utc> = row.get("current_time");
+            let pg_version: String = row.get("pg_version");
+            Ok(format!(
+                "Database connected!\nPostgreSQL version: {}\nCurrent time: {}",
+                pg_version, current_time
+            ))
+        }
+        Err(e) => Ok(format!("Database error: {}", e)),
+    }
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    // Database connection string
+    // From within Docker network, use service name: actfinal-postgres
+    // From host machine, use: localhost:5433
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://actfinal_user:qwert@actfinal-postgres:5432/actfinal_db".to_string());
+
+    // Create database connection pool
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    // Test the connection
+    sqlx::query("SELECT 1")
+        .execute(&pool)
+        .await
+        .expect("Failed to execute test query");
+
+    println!("✓ Database connection established");
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .service(web::scope("/api")
+                .route("/name/{name}", web::get().to(name))
+                .route("/db", web::get().to(db_check))
+            )
+            .route("/health", web::get().to(health))
+            .route("/", web::get().to(index))
+    })
+    .bind("0.0.0.0:8080")?
+    .run()
+    .await
+}
