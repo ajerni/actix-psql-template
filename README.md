@@ -243,6 +243,9 @@ The template includes several example routes:
    # Delete
    curl -X DELETE -H "x-api-key: my-api-apisecret" http://localhost:8083/api/users/1
    ```
+**CREATE YOUR FRONTEND: Put this in a text file and give your favourite LLM a prompt like:**
+
+   "see available api end points in @api_routes.txt and write a simple but nice looking frontend (one index.html file) that allows for these CRUD operations (including edit area on top and display area below)"
 
 ## Database Configuration
 
