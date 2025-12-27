@@ -24,11 +24,11 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the binary from builder
-COPY --from=builder /app/target/release/actfinal /app/actfinal
+COPY --from=builder /app/target/release/aaabbb /app/aaabbb
 
 # Expose port
 EXPOSE 8080
 
 # Run the application
-CMD ["./actfinal"]
+CMD ["./aaabbb"]
 

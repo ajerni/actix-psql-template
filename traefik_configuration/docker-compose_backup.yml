@@ -1,0 +1,20 @@
+version: '3.4'
+
+services:
+  traefik:
+    container_name: traefik
+    restart: unless-stopped
+    image: traefik
+    networks:
+      - iotnetwork
+    ports:
+      - "81:81"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/traefik.yml
+      - ./traefik_api.yml:/traefik_api.yml
+      - ./acme.json:/cert/acme.json
+networks:
+  iotnetwork:
+    external: true

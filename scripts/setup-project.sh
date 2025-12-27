@@ -138,6 +138,22 @@ if [ -f "Cargo.toml" ]; then
     sed -i.bak \
         -e "s/^name = \".*\"/name = \"${PROJECT_NAME_HYPHEN}\"/g" \
         Cargo.toml
+    # Ensure actix-cors is in dependencies
+    if ! grep -q "actix-cors" Cargo.toml; then
+        # Add actix-cors after actix-rt line
+        sed -i.bak2 '/^actix-rt = /a\
+actix-cors = "0.7"
+' Cargo.toml
+        rm -f Cargo.toml.bak2
+    fi
+    # Ensure futures-util is in dependencies
+    if ! grep -q "futures-util" Cargo.toml; then
+        # Add futures-util after chrono line
+        sed -i.bak3 '/^chrono = /a\
+futures-util = "0.3"
+' Cargo.toml
+        rm -f Cargo.toml.bak3
+    fi
     rm -f Cargo.toml.bak
 else
     echo "  - Warning: Cargo.toml not found"
@@ -177,8 +193,12 @@ fi
 # Create/overwrite main.rs with fresh template
 echo "  - Creating/updating main.rs"
 cat > main.rs << MAIN_EOF
-use actix_web::{web, App, HttpServer, Responder, Result};
+use actix_web::{web, App, HttpServer, Responder, Result, Error, HttpResponse};
+use actix_web::dev::{ServiceRequest, ServiceResponse, Service, Transform};
+use actix_cors::Cors;
 use sqlx::{PgPool, Row};
+use std::future::{ready, Ready};
+use futures_util::future::LocalBoxFuture;
 
 async fn index() -> impl Responder {
     "Hello from Actix Web!"
@@ -210,6 +230,79 @@ async fn db_check(pool: web::Data<PgPool>) -> Result<impl Responder> {
     }
 }
 
+// Authorization Middleware
+pub struct AuthMiddleware {
+    expected_api_key: String,
+}
+
+impl AuthMiddleware {
+    pub fn new(expected_api_key: String) -> Self {
+        AuthMiddleware { expected_api_key }
+    }
+}
+
+impl<S, B> Transform<S, ServiceRequest> for AuthMiddleware
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type InitError = ();
+    type Transform = AuthMiddlewareService<S>;
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ready(Ok(AuthMiddlewareService {
+            service,
+            expected_api_key: self.expected_api_key.clone(),
+        }))
+    }
+}
+
+pub struct AuthMiddlewareService<S> {
+    service: S,
+    expected_api_key: String,
+}
+
+impl<S, B> Service<ServiceRequest> for AuthMiddlewareService<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    actix_web::dev::forward_ready!(service);
+
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        let expected_key = self.expected_api_key.clone();
+        
+        // Check for x-api-key header
+        let auth_header = req.headers().get("x-api-key");
+        
+        match auth_header {
+            Some(header_value) if header_value.to_str().unwrap_or("") == expected_key => {
+                // Valid API key, proceed
+                let fut = self.service.call(req);
+                Box::pin(async move {
+                    let res = fut.await?;
+                    Ok(res)
+                })
+            }
+            _ => {
+                // Invalid or missing API key
+                Box::pin(async move {
+                    Err(actix_web::error::ErrorUnauthorized("Invalid or missing x-api-key header"))
+                })
+            }
+        }
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Database connection string
@@ -231,12 +324,32 @@ async fn main() -> std::io::Result<()> {
 
     println!("✓ Database connection established");
 
+    // API key for authorization
+    let api_key = "${PROJECT_NAME_HYPHEN}-apisecret".to_string();
+    println!("===========================================");
+    println!("✓ x-api-key: {}", api_key);
+    println!("===========================================");
+
     HttpServer::new(move || {
+        // Configure CORS - Allow all origins with credentials
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+            .allowed_headers(vec![
+                actix_web::http::header::CONTENT_TYPE,
+                actix_web::http::header::HeaderName::from_static("x-api-key"),
+            ])
+            .supports_credentials()
+            .max_age(3600);
+
         App::new()
+            .wrap(cors)  // CORS middleware (applied first, outermost)
             .app_data(web::Data::new(pool.clone()))
-            .service(web::scope("/api")
-                .route("/name/{name}", web::get().to(name))
-                .route("/db", web::get().to(db_check))
+            .service(
+                web::scope("/api")
+                    .wrap(AuthMiddleware::new(api_key.clone()))  // Auth middleware (applied after CORS)
+                    .route("/name/{name}", web::get().to(name))
+                    .route("/db", web::get().to(db_check))
             )
             .route("/health", web::get().to(health))
             .route("/", web::get().to(index))
@@ -252,9 +365,11 @@ echo -e "${GREEN}✓ Setup complete!${NC}"
 echo ""
 echo "Next steps:"
 echo "  1. Review the changes in docker-compose.yml, Cargo.toml, and Dockerfile"
-echo "  2. Run: docker-compose up --build -d""
-echo "  2. Update main.rs with your application code or run setup-db.sh to create a fresh table"
-echo "  3. Run: docker-compose down"
-echo "  4. Run: docker-compose up --build -d"
+echo "  2. Ensure actix-cors is in Cargo.toml dependencies (should be added automatically)"
+echo "  3. Run: docker-compose up --build -d"
+echo "  4. View logs to see API key: docker-compose logs ${PROJECT_NAME_HYPHEN}"
+echo "  5. API Key for authorization: ${PROJECT_NAME_HYPHEN}-apisecret"
+echo "  6. CORS is configured to allow all origins with credentials support"
+echo "  7. Update main.rs with your application code or run setup-db.sh to create a fresh table"
 echo ""
 

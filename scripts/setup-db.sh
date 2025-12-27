@@ -545,8 +545,22 @@ if grep -q '\.route("/db"' main.rs; then
         }
         { print }
     ' main.rs > main.rs.tmp && mv main.rs.tmp main.rs
+elif grep -q '\.wrap(AuthMiddleware' main.rs; then
+    # Insert after the .wrap(AuthMiddleware...) line if it exists
+    awk -v routes_file="$ROUTES_FILE" '
+        /\.wrap\(AuthMiddleware/ {
+            print
+            # Read and print the routes
+            while ((getline line < routes_file) > 0) {
+                print line
+            }
+            close(routes_file)
+            next
+        }
+        { print }
+    ' main.rs > main.rs.tmp && mv main.rs.tmp main.rs
 elif grep -q 'web::scope("/api")' main.rs; then
-    # Insert after the first route in the API scope
+    # Insert after the first route in the API scope (fallback)
     awk -v routes_file="$ROUTES_FILE" '
         !done && /\.service\(web::scope\("\/api"\)/ {
             in_scope = 1
